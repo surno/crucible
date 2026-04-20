@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 thiserror = "2.0.18"
 wasmtime = "43.0.1"
+
+[dev-dependencies]
+wat = "1.247.0"
