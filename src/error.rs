@@ -15,7 +15,7 @@ pub enum SandboxError {
     OutOfFuel,
 
     #[error("guest exceeded its {limit_bytes}-byte memory limit")]
-    MemoryExceeded { limit_bytes: usize },
+    MemoryExceeded { limit_bytes: u64 },
 
     #[error("guest exceeded its execution timeout")]
     Timeout,
