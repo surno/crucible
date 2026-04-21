@@ -1,5 +1,7 @@
 use std::num::TryFromIntError;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::{scope, sleep};
+use std::time::{Duration, Instant};
 
 use wasmtime::{Config, Engine, Instance, Module, Store, Trap, Val};
 
@@ -26,27 +28,7 @@ impl Sandbox {
     }
 
     pub fn run(&self, wasm: &[u8], func_name: &str, args: &[Val]) -> Result<Vec<Val>> {
-        let state = SandboxData {
-            limiter: CrucibleResourceLimiter::new(
-                self.memory_limit
-                    .as_bytes()
-                    .try_into()
-                    .map_err(|e: TryFromIntError| {
-                        SandboxError::InvalidConfig(format!(
-                            "Failed to convert memory limit to host: {}",
-                            e.to_string()
-                        ))
-                    })?,
-            ),
-        };
-        let mut store = Store::new(&self.engine, state);
-
-        if let Some(fuel) = self.fuel_limit {
-            store.set_fuel(fuel).map_err(SandboxError::EngineInit)?;
-        }
-
-        store.limiter(|state| &mut state.limiter);
-
+        let mut store = self.configure_store()?;
         let module = Module::from_binary(&self.engine, wasm).map_err(SandboxError::Compile)?;
 
         let instance = Instance::new(&mut store, &module, &[]).map_err(SandboxError::Compile)?;
@@ -57,22 +39,81 @@ impl Sandbox {
 
         let result_count = func.ty(&store).results().len();
         let mut result = vec![Val::I32(0); result_count];
-        func.call(&mut store, args, &mut result)
-            .map_err(|e: wasmtime::Error| self.clasify_call_error(e, &store))?;
+
+        // call the thread which will manage the timeout
+        let stop = AtomicBool::new(false);
+        scope(|s| {
+            if let Some(timeout) = self.timeout {
+                let backstop = timeout + Duration::from_millis(100);
+                let engine_weak = self.engine.weak();
+                let stop_ref = &stop;
+                s.spawn(move || {
+                    let start = Instant::now();
+                    while !stop_ref.load(Ordering::Relaxed) {
+                        sleep(Duration::from_millis(1));
+                        let Some(e) = engine_weak.upgrade() else {
+                            break;
+                        };
+                        e.increment_epoch();
+
+                        // Backstop: if the trap was supposed to fire long ago, but
+                        // hasn't. We must bail out since additional ticks won't help
+                        if start.elapsed() > backstop {
+                            break;
+                        }
+                    }
+                });
+            }
+
+            let r = func
+                .call(&mut store, args, &mut result)
+                .map_err(|e: wasmtime::Error| self.classify_call_error(e, &store));
+            // signal the the spawned thread that the engine has ran the function and completed.
+            stop.store(true, Ordering::Relaxed);
+            r
+        })?;
         Ok(result)
     }
 
-    fn clasify_call_error(&self, e: wasmtime::Error, store: &Store<SandboxData>) -> SandboxError {
-        if store.data().limiter.refused_memory_growth() {
-            SandboxError::MemoryExceeded {
+    fn configure_store(&self) -> Result<Store<SandboxData>> {
+        let state = SandboxData {
+            limiter: CrucibleResourceLimiter::new(
+                self.memory_limit
+                    .as_bytes()
+                    .try_into()
+                    .map_err(|e: TryFromIntError| {
+                        SandboxError::InvalidConfig(format!(
+                            "Failed to convert memory limit to host: {e}"
+                        ))
+                    })?,
+            ),
+        };
+        let mut store = Store::new(&self.engine, state);
+
+        if let Some(fuel) = self.fuel_limit {
+            store.set_fuel(fuel).map_err(SandboxError::EngineInit)?;
+        }
+
+        if let Some(duration) = self.timeout {
+            let ticks = u64::try_from(duration.as_millis()).map_err(|_| {
+                SandboxError::InvalidConfig(format!("timeout {duration:?} exceeds u64 ms"))
+            })?;
+            store.set_epoch_deadline(ticks); // arm this store's trap
+        }
+
+        store.limiter(|state| &mut state.limiter);
+        Ok(store)
+    }
+
+    fn classify_call_error(&self, e: wasmtime::Error, store: &Store<SandboxData>) -> SandboxError {
+        let refused = store.data().limiter.refused_memory_growth();
+        match e.downcast_ref::<Trap>() {
+            Some(Trap::OutOfFuel) => SandboxError::OutOfFuel,
+            Some(Trap::Interrupt) => SandboxError::Timeout,
+            Some(Trap::MemoryOutOfBounds) if refused => SandboxError::MemoryExceeded {
                 limit_bytes: self.memory_limit.as_bytes(),
-            }
-        } else {
-            match e.downcast_ref::<Trap>() {
-                Some(Trap::OutOfFuel) => SandboxError::OutOfFuel,
-                Some(Trap::Interrupt) => SandboxError::Timeout,
-                _ => SandboxError::Trap(e.to_string()),
-            }
+            },
+            _ => SandboxError::Trap(e.to_string()),
         }
     }
 }
@@ -296,7 +337,9 @@ mod tests {
                     memory.grow))",
         );
 
-        let result = sandbox.run(&bytes, "grow_one", &[]).expect("grow within limit succeeds");
+        let result = sandbox
+            .run(&bytes, "grow_one", &[])
+            .expect("grow within limit succeeds");
         // memory.grow returns the previous size in pages on success (1), or -1 on failure.
         assert_eq!(result[0].i32(), Some(1));
     }
@@ -306,7 +349,9 @@ mod tests {
         // Limit = 1 page. Module starts at 1 page, asks to grow by 100 (denied),
         // then writes way past the current size — that write traps.
         // The limiter's refusal flag should override the generic trap classification.
-        let sandbox = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT).build().unwrap();
+        let sandbox = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
+            .build()
+            .unwrap();
         let bytes = wasm(
             "(module
                 (memory 1)
@@ -333,7 +378,9 @@ mod tests {
         // The guest asks for too much memory, sees -1 from memory.grow, and returns it.
         // No trap → no error path → MemoryExceeded must NOT fire even though the
         // limiter recorded a refusal.
-        let sandbox = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT).build().unwrap();
+        let sandbox = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
+            .build()
+            .unwrap();
         let bytes = wasm(
             "(module
                 (memory 1)
@@ -342,7 +389,55 @@ mod tests {
                     memory.grow))",
         );
 
-        let result = sandbox.run(&bytes, "try_grow", &[]).expect("call should succeed");
+        let result = sandbox
+            .run(&bytes, "try_grow", &[])
+            .expect("call should succeed");
         assert_eq!(result[0].i32(), Some(-1));
+    }
+
+    #[test]
+    fn run_times_out_on_infinite_loop() {
+        let sandbox = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let bytes = wasm("(module (func (export \"spin\") (loop $l br $l)))");
+
+        let err = sandbox.run(&bytes, "spin", &[]).unwrap_err();
+        assert!(matches!(err, SandboxError::Timeout));
+    }
+
+    #[test]
+    fn run_returns_out_of_fuel_when_fuel_exhausted_after_grow_denied() {
+        let s = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
+            .fuel(100_000)
+            .build()
+            .unwrap();
+        let bytes = wasm(
+            "(module (memory 1) (func (export \"f\")
+        i32.const 100 memory.grow drop
+        (loop $l br $l)))",
+        );
+        assert!(matches!(
+            s.run(&bytes, "f", &[]).unwrap_err(),
+            SandboxError::OutOfFuel
+        ));
+    }
+
+    #[test]
+    fn run_returns_timeout_when_loop_runs_after_grow_denied() {
+        let s = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let bytes = wasm(
+            "(module (memory 1) (func (export \"f\")
+        i32.const 100 memory.grow drop
+        (loop $l br $l)))",
+        );
+        assert!(matches!(
+            s.run(&bytes, "f", &[]).unwrap_err(),
+            SandboxError::Timeout
+        ));
     }
 }
