@@ -1,8 +1,10 @@
 use std::time::Duration;
 
+use wasmtime::Linker;
 use wasmtime::{Config, Engine};
 
 use super::Sandbox;
+use super::data::SandboxData;
 use crate::error::{Result, SandboxError};
 use crate::units::ByteSize;
 
@@ -40,11 +42,15 @@ impl SandboxBuilder {
             config.epoch_interruption(true);
         }
         let engine = Engine::new(&config).map_err(SandboxError::EngineInit)?;
+        let mut linker = Linker::<SandboxData>::new(&engine);
+        wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |cx| &mut cx.wasi_p1_ctx)
+            .map_err(SandboxError::EngineInit)?;
         Ok(Sandbox::new(
             engine,
             self.fuel,
             self.memory_limit,
             self.timeout,
+            linker,
         ))
     }
 }

@@ -1,15 +1,18 @@
 mod builder;
 mod data;
+mod invocation;
 
 use std::num::TryFromIntError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{scope, sleep};
 use std::time::{Duration, Instant};
 
-use wasmtime::{Engine, Instance, Module, Store, Trap, Val};
+use wasmtime::{Engine, Linker, Module, Store, Trap, Val};
 
 pub use builder::SandboxBuilder;
 use data::SandboxData;
+pub use invocation::Invocation;
+use wasmtime_wasi::p1::WasiP1Ctx;
 
 use crate::error::{Result, SandboxError};
 use crate::limits::CrucibleResourceLimiter;
@@ -20,6 +23,7 @@ pub struct Sandbox {
     fuel_limit: Option<u64>,
     memory_limit: ByteSize,
     timeout: Option<Duration>,
+    linker: Linker<SandboxData>,
 }
 
 impl Sandbox {
@@ -34,20 +38,29 @@ impl Sandbox {
         fuel_limit: Option<u64>,
         memory_limit: ByteSize,
         timeout: Option<Duration>,
+        linker: Linker<SandboxData>,
     ) -> Self {
         Self {
             engine,
             fuel_limit,
             memory_limit,
             timeout,
+            linker,
         }
     }
 
-    pub fn run(&self, wasm: &[u8], func_name: &str, args: &[Val]) -> Result<Vec<Val>> {
-        let mut store = self.configure_store()?;
-        let module = Module::from_binary(&self.engine, wasm).map_err(SandboxError::Compile)?;
+    pub fn module<'a>(&'a self, wasm: &'a [u8]) -> Invocation<'a> {
+        Invocation::new(self, wasm)
+    }
 
-        let instance = Instance::new(&mut store, &module, &[]).map_err(SandboxError::Compile)?;
+    fn run(&self, wasm: &[u8], func_name: &str, args: &[Val], wasi: WasiP1Ctx) -> Result<Vec<Val>> {
+        let mut store = self.configure_store(wasi)?;
+        let module = Module::new(&self.engine, wasm).map_err(SandboxError::Compile)?;
+
+        let instance = self
+            .linker
+            .instantiate(&mut store, &module)
+            .map_err(SandboxError::Compile)?;
 
         let func = instance
             .get_func(&mut store, func_name)
@@ -91,7 +104,7 @@ impl Sandbox {
         Ok(result)
     }
 
-    fn configure_store(&self) -> Result<Store<SandboxData>> {
+    fn configure_store(&self, wasi_p1_ctx: WasiP1Ctx) -> Result<Store<SandboxData>> {
         let state = SandboxData {
             limiter: CrucibleResourceLimiter::new(
                 self.memory_limit
@@ -103,8 +116,9 @@ impl Sandbox {
                         ))
                     })?,
             ),
+            wasi_p1_ctx,
         };
-        let mut store = Store::new(&self.engine, state);
+        let mut store: Store<SandboxData> = Store::new(&self.engine, state);
 
         if let Some(fuel) = self.fuel_limit {
             store.set_fuel(fuel).map_err(SandboxError::EngineInit)?;
@@ -136,6 +150,8 @@ impl Sandbox {
 
 #[cfg(test)]
 mod tests {
+    use wasmtime_wasi::WasiCtxBuilder;
+
     use super::*;
 
     #[test]
@@ -177,7 +193,7 @@ mod tests {
         let bytes = wasm("(module (func (export \"noop\")))");
 
         let result = sandbox
-            .run(&bytes, "noop", &[])
+            .run(&bytes, "noop", &[], WasiCtxBuilder::new().build_p1())
             .expect("call should succeed");
         assert!(result.is_empty());
     }
@@ -189,7 +205,9 @@ mod tests {
             .unwrap();
         let bytes = wasm("(module (func (export \"answer\") (result i32) i32.const 42))");
 
-        let result = sandbox.run(&bytes, "answer", &[]).unwrap();
+        let result = sandbox
+            .run(&bytes, "answer", &[], WasiCtxBuilder::new().build_p1())
+            .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].i32(), Some(42));
     }
@@ -205,7 +223,12 @@ mod tests {
         );
 
         let result = sandbox
-            .run(&bytes, "add", &[Val::I32(7), Val::I32(35)])
+            .run(
+                &bytes,
+                "add",
+                &[Val::I32(7), Val::I32(35)],
+                WasiCtxBuilder::new().build_p1(),
+            )
             .unwrap();
         assert_eq!(result[0].i32(), Some(42));
     }
@@ -217,7 +240,9 @@ mod tests {
             .unwrap();
         let bytes = wasm("(module (func (export \"only\")))");
 
-        let err = sandbox.run(&bytes, "missing", &[]).unwrap_err();
+        let err = sandbox
+            .run(&bytes, "missing", &[], WasiCtxBuilder::new().build_p1())
+            .unwrap_err();
         match err {
             SandboxError::Trap(msg) => assert!(msg.contains("missing")),
             other => panic!("expected Trap, got {other:?}"),
@@ -231,7 +256,12 @@ mod tests {
             .unwrap();
 
         let err = sandbox
-            .run(b"definitely not wasm", "anything", &[])
+            .run(
+                b"definitely not wasm",
+                "anything",
+                &[],
+                WasiCtxBuilder::new().build_p1(),
+            )
             .unwrap_err();
         assert!(matches!(err, SandboxError::Compile(_)));
     }
@@ -244,7 +274,9 @@ mod tests {
             .unwrap();
         let bytes = wasm("(module (func (export \"spin\") (loop $l br $l)))");
 
-        let err = sandbox.run(&bytes, "spin", &[]).unwrap_err();
+        let err = sandbox
+            .run(&bytes, "spin", &[], WasiCtxBuilder::new().build_p1())
+            .unwrap_err();
         assert!(matches!(err, SandboxError::OutOfFuel));
     }
 
@@ -256,7 +288,14 @@ mod tests {
         let bytes = wasm("(module (func (export \"need_i32\") (param i32)))");
 
         // Function wants i32, we pass i64 — wasmtime should reject the call.
-        let err = sandbox.run(&bytes, "need_i32", &[Val::I64(0)]).unwrap_err();
+        let err = sandbox
+            .run(
+                &bytes,
+                "need_i32",
+                &[Val::I64(0)],
+                WasiCtxBuilder::new().build_p1(),
+            )
+            .unwrap_err();
         assert!(matches!(err, SandboxError::Trap(_)));
     }
 
@@ -273,7 +312,7 @@ mod tests {
         );
 
         let result = sandbox
-            .run(&bytes, "grow_one", &[])
+            .run(&bytes, "grow_one", &[], WasiCtxBuilder::new().build_p1())
             .expect("grow within limit succeeds");
         // memory.grow returns the previous size in pages on success (1), or -1 on failure.
         assert_eq!(result[0].i32(), Some(1));
@@ -299,7 +338,14 @@ mod tests {
                     i32.store))",
         );
 
-        let err = sandbox.run(&bytes, "grow_then_oob", &[]).unwrap_err();
+        let err = sandbox
+            .run(
+                &bytes,
+                "grow_then_oob",
+                &[],
+                WasiCtxBuilder::new().build_p1(),
+            )
+            .unwrap_err();
         match err {
             SandboxError::MemoryExceeded { limit_bytes } => {
                 assert_eq!(limit_bytes, Sandbox::DEFAULT_MEMORY_LIMIT.as_bytes());
@@ -325,7 +371,7 @@ mod tests {
         );
 
         let result = sandbox
-            .run(&bytes, "try_grow", &[])
+            .run(&bytes, "try_grow", &[], WasiCtxBuilder::new().build_p1())
             .expect("call should succeed");
         assert_eq!(result[0].i32(), Some(-1));
     }
@@ -338,7 +384,9 @@ mod tests {
             .unwrap();
         let bytes = wasm("(module (func (export \"spin\") (loop $l br $l)))");
 
-        let err = sandbox.run(&bytes, "spin", &[]).unwrap_err();
+        let err = sandbox
+            .run(&bytes, "spin", &[], WasiCtxBuilder::new().build_p1())
+            .unwrap_err();
         assert!(matches!(err, SandboxError::Timeout));
     }
 
@@ -354,7 +402,8 @@ mod tests {
         (loop $l br $l)))",
         );
         assert!(matches!(
-            s.run(&bytes, "f", &[]).unwrap_err(),
+            s.run(&bytes, "f", &[], WasiCtxBuilder::new().build_p1())
+                .unwrap_err(),
             SandboxError::OutOfFuel
         ));
     }
@@ -371,8 +420,77 @@ mod tests {
         (loop $l br $l)))",
         );
         assert!(matches!(
-            s.run(&bytes, "f", &[]).unwrap_err(),
+            s.run(&bytes, "f", &[], WasiCtxBuilder::new().build_p1())
+                .unwrap_err(),
             SandboxError::Timeout
         ));
+    }
+
+    #[test]
+    fn run_returns_compile_error_for_unsatisfied_import() {
+        // Guest imports a function the linker doesn't know about. Instantiation must fail.
+        let sandbox = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
+            .build()
+            .unwrap();
+        let bytes = wasm(
+            "(module
+                (import \"custom\" \"unknown_fn\" (func))
+                (func (export \"noop\")))",
+        );
+
+        let err = sandbox
+            .run(&bytes, "noop", &[], WasiCtxBuilder::new().build_p1())
+            .unwrap_err();
+        assert!(
+            matches!(err, SandboxError::Compile(_)),
+            "expected Compile, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn wasi_imports_are_resolved_at_link_time() {
+        // Guest declares a WASI import but never calls it. Instantiation must succeed,
+        // proving `add_to_linker_sync` registered the WASI host functions.
+        let sandbox = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
+            .build()
+            .unwrap();
+        let bytes = wasm(
+            "(module
+                (import \"wasi_snapshot_preview1\" \"clock_time_get\"
+                    (func (param i32 i64 i32) (result i32)))
+                (func (export \"noop\")))",
+        );
+
+        sandbox
+            .run(&bytes, "noop", &[], WasiCtxBuilder::new().build_p1())
+            .expect("WASI imports should be resolvable");
+    }
+
+    #[test]
+    fn wasi_random_get_is_callable_from_guest() {
+        // Calls a WASI host function from inside wasm. Proves not just linking but
+        // actual host-function dispatch through the linker.
+        let sandbox = Sandbox::builder(ByteSize::mib(1)).build().unwrap();
+        let bytes = wasm(
+            "(module
+                (import \"wasi_snapshot_preview1\" \"random_get\"
+                    (func $rand (param i32 i32) (result i32)))
+                (memory (export \"memory\") 1)
+                (func (export \"fill_random\") (result i32)
+                    i32.const 0      ;; buf_ptr
+                    i32.const 16     ;; buf_len
+                    call $rand))",
+        );
+
+        let result = sandbox
+            .run(
+                &bytes,
+                "fill_random",
+                &[],
+                WasiCtxBuilder::new().build_p1(),
+            )
+            .expect("random_get should be callable");
+        // WASI errno 0 = success.
+        assert_eq!(result[0].i32(), Some(0));
     }
 }
