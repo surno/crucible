@@ -1,17 +1,19 @@
+mod builder;
+mod data;
+
 use std::num::TryFromIntError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{scope, sleep};
 use std::time::{Duration, Instant};
 
-use wasmtime::{Config, Engine, Instance, Module, Store, Trap, Val};
+use wasmtime::{Engine, Instance, Module, Store, Trap, Val};
+
+pub use builder::SandboxBuilder;
+use data::SandboxData;
 
 use crate::error::{Result, SandboxError};
 use crate::limits::CrucibleResourceLimiter;
 use crate::units::ByteSize;
-
-struct SandboxData {
-    limiter: CrucibleResourceLimiter,
-}
 
 pub struct Sandbox {
     engine: Engine,
@@ -25,6 +27,20 @@ impl Sandbox {
 
     pub fn builder(memory_limit: ByteSize) -> SandboxBuilder {
         SandboxBuilder::new(memory_limit)
+    }
+
+    fn new(
+        engine: Engine,
+        fuel_limit: Option<u64>,
+        memory_limit: ByteSize,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Self {
+            engine,
+            fuel_limit,
+            memory_limit,
+            timeout,
+        }
     }
 
     pub fn run(&self, wasm: &[u8], func_name: &str, args: &[Val]) -> Result<Vec<Val>> {
@@ -118,55 +134,6 @@ impl Sandbox {
     }
 }
 
-pub struct SandboxBuilder {
-    memory_limit: ByteSize,
-    fuel: Option<u64>,
-    timeout: Option<Duration>,
-}
-
-impl SandboxBuilder {
-    pub fn new(memory_limit: ByteSize) -> Self {
-        Self {
-            memory_limit,
-            fuel: None,
-            timeout: None,
-        }
-    }
-
-    pub fn fuel(mut self, amount: u64) -> Self {
-        self.fuel = Some(amount);
-        self
-    }
-
-    pub fn timeout(mut self, duration: Duration) -> Self {
-        self.timeout = Some(duration);
-        self
-    }
-
-    pub fn build(self) -> Result<Sandbox> {
-        let mut config = Config::default();
-        if self.fuel.is_some() {
-            config.consume_fuel(true);
-        }
-        if self.timeout.is_some() {
-            config.epoch_interruption(true);
-        }
-        let engine = Engine::new(&config).map_err(SandboxError::EngineInit)?;
-        Ok(Sandbox {
-            engine,
-            fuel_limit: self.fuel,
-            memory_limit: self.memory_limit,
-            timeout: self.timeout,
-        })
-    }
-}
-
-impl Default for SandboxBuilder {
-    fn default() -> Self {
-        Self::new(Sandbox::DEFAULT_MEMORY_LIMIT)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,39 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn default_builder_uses_default_memory_limit() {
-        let b = SandboxBuilder::default();
-        assert_eq!(b.memory_limit, Sandbox::DEFAULT_MEMORY_LIMIT);
-    }
-
-    #[test]
-    fn builder_starts_with_no_fuel_or_timeout() {
-        let b = Sandbox::builder(ByteSize::mib(1));
-        assert_eq!(b.memory_limit, ByteSize::mib(1));
-        assert_eq!(b.fuel, None);
-        assert_eq!(b.timeout, None);
-    }
-
-    #[test]
-    fn setters_record_values() {
-        let b = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
-            .fuel(1_000)
-            .timeout(Duration::from_millis(500));
-        assert_eq!(b.memory_limit, Sandbox::DEFAULT_MEMORY_LIMIT);
-        assert_eq!(b.fuel, Some(1_000));
-        assert_eq!(b.timeout, Some(Duration::from_millis(500)));
-    }
-
-    #[test]
-    fn last_setter_wins() {
-        let b = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
-            .fuel(100)
-            .fuel(200);
-        assert_eq!(b.fuel, Some(200));
-    }
-
-    #[test]
-    fn build_with_no_options_succeeds() {
+    fn build_with_no_options_produces_sandbox_with_no_fuel_or_timeout() {
         let sandbox = Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
             .build()
             .expect("build should succeed");
