@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use crate::{SandboxError, error::Result};
 
@@ -19,6 +19,7 @@ pub struct Invocation<'a> {
     sandbox: &'a Sandbox,
     wasm: &'a [u8],
     preopens: Vec<Preopen>,
+    env: HashMap<String, String>,
 }
 
 impl<'a> Invocation<'a> {
@@ -27,6 +28,7 @@ impl<'a> Invocation<'a> {
             sandbox,
             wasm,
             preopens: Vec::new(),
+            env: HashMap::new(),
         }
     }
 
@@ -41,6 +43,11 @@ impl<'a> Invocation<'a> {
             dir_perms: DirPerms::READ,
             file_perms: FilePerms::READ,
         });
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
+        self.env.insert(key.into(), val.into());
         self
     }
 
@@ -71,6 +78,10 @@ impl<'a> Invocation<'a> {
                 .map_err(|e| SandboxError::InvalidConfig(e.to_string()))?;
         }
 
+        for (key, val) in self.env {
+            wasi_builder.env(key, val);
+        }
+
         self.sandbox
             .run(self.wasm, func_name, args, wasi_builder.build_p1())
     }
@@ -86,7 +97,9 @@ mod tests {
     }
 
     fn sandbox() -> Sandbox {
-        Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT).build().unwrap()
+        Sandbox::builder(Sandbox::DEFAULT_MEMORY_LIMIT)
+            .build()
+            .unwrap()
     }
 
     #[test]
@@ -94,7 +107,10 @@ mod tests {
         let s = sandbox();
         let bytes = wasm("(module (func (export \"noop\")))");
 
-        let result = s.module(&bytes).invoke("noop", &[]).expect("invoke should succeed");
+        let result = s
+            .module(&bytes)
+            .invoke("noop", &[])
+            .expect("invoke should succeed");
         assert!(result.is_empty());
     }
 
@@ -132,7 +148,10 @@ mod tests {
             .module(&bytes)
             .allow_read_dir(std::env::temp_dir(), "/data")
             .invoke("noop", &[]);
-        assert!(result.is_ok(), "invoke with valid preopen should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "invoke with valid preopen should succeed: {result:?}"
+        );
     }
 
     #[test]
@@ -146,7 +165,10 @@ mod tests {
             .allow_read_dir(&temp, "/in")
             .allow_write_dir(&temp, "/out")
             .invoke("noop", &[]);
-        assert!(result.is_ok(), "multiple preopens should compose: {result:?}");
+        assert!(
+            result.is_ok(),
+            "multiple preopens should compose: {result:?}"
+        );
     }
 
     #[test]
@@ -193,5 +215,97 @@ mod tests {
 
         let result = s.module(&bytes).invoke("grow", &[]).unwrap();
         assert_eq!(result[0].i32(), Some(-1));
+    }
+
+    #[test]
+    fn invocation_starts_with_empty_env() {
+        let s = sandbox();
+        let bytes = wasm("(module)");
+        let inv = s.module(&bytes);
+        assert!(inv.env.is_empty());
+    }
+
+    #[test]
+    fn env_setter_records_value() {
+        let s = sandbox();
+        let bytes = wasm("(module)");
+        let inv = s.module(&bytes).env("LANG", "en_US.UTF-8");
+        assert_eq!(inv.env.get("LANG"), Some(&"en_US.UTF-8".to_string()));
+        assert_eq!(inv.env.len(), 1);
+    }
+
+    #[test]
+    fn env_last_setter_wins_for_same_key() {
+        let s = sandbox();
+        let bytes = wasm("(module)");
+        let inv = s.module(&bytes).env("KEY", "first").env("KEY", "second");
+        assert_eq!(inv.env.get("KEY"), Some(&"second".to_string()));
+        assert_eq!(inv.env.len(), 1);
+    }
+
+    #[test]
+    fn env_multiple_keys_accumulate() {
+        let s = sandbox();
+        let bytes = wasm("(module)");
+        let inv = s
+            .module(&bytes)
+            .env("FOO", "1")
+            .env("BAR", "2")
+            .env("BAZ", "3");
+        assert_eq!(inv.env.len(), 3);
+        assert_eq!(inv.env.get("FOO"), Some(&"1".to_string()));
+        assert_eq!(inv.env.get("BAR"), Some(&"2".to_string()));
+        assert_eq!(inv.env.get("BAZ"), Some(&"3".to_string()));
+    }
+
+    #[test]
+    fn env_reaches_guest_via_environ_sizes_get() {
+        // Round-trip: set N env vars on the host, verify the guest sees N via WASI.
+        let s = Sandbox::builder(ByteSize::mib(1)).build().unwrap();
+        let bytes = wasm(
+            "(module
+                (import \"wasi_snapshot_preview1\" \"environ_sizes_get\"
+                    (func $env_sizes (param i32 i32) (result i32)))
+                (memory (export \"memory\") 1)
+                (func (export \"env_count\") (result i32)
+                    ;; environ_sizes_get(count_ptr=0, buf_size_ptr=4)
+                    i32.const 0
+                    i32.const 4
+                    call $env_sizes
+                    drop
+                    ;; read back the count from addr 0
+                    i32.const 0
+                    i32.load))",
+        );
+
+        let result = s
+            .module(&bytes)
+            .env("FOO", "1")
+            .env("BAR", "2")
+            .invoke("env_count", &[])
+            .expect("invoke should succeed");
+        assert_eq!(result[0].i32(), Some(2));
+    }
+
+    #[test]
+    fn env_empty_when_no_env_set() {
+        // Without any .env() calls the guest should see zero env vars.
+        let s = Sandbox::builder(ByteSize::mib(1)).build().unwrap();
+        let bytes = wasm(
+            "(module
+                (import \"wasi_snapshot_preview1\" \"environ_sizes_get\"
+                    (func $env_sizes (param i32 i32) (result i32)))
+                (memory (export \"memory\") 1)
+                (func (export \"env_count\") (result i32)
+                    i32.const 0
+                    i32.const 4
+                    call $env_sizes
+                    drop
+                    i32.const 0
+                    i32.load))",
+        );
+
+        let result = s.module(&bytes).invoke("env_count", &[]).unwrap();
+        assert_eq!(result[0].i32(), Some(0));
     }
 }

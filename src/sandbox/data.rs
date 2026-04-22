@@ -1,4 +1,4 @@
-use wasmtime_wasi::{WasiView, p1::WasiP1Ctx};
+use wasmtime_wasi::p1::WasiP1Ctx;
 
 use crate::limits::CrucibleResourceLimiter;
 
