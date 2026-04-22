@@ -308,4 +308,106 @@ mod tests {
         let result = s.module(&bytes).invoke("env_count", &[]).unwrap();
         assert_eq!(result[0].i32(), Some(0));
     }
+
+    /// Reads `environ_sizes_get`'s buffer-size output from address 4.
+    /// The guest serialization is `key=value\0` per entry, so total = sum(k.len + v.len + 2).
+    fn env_buf_size_wasm() -> Vec<u8> {
+        wasm(
+            "(module
+                (import \"wasi_snapshot_preview1\" \"environ_sizes_get\"
+                    (func $env_sizes (param i32 i32) (result i32)))
+                (memory (export \"memory\") 1)
+                (func (export \"buf_size\") (result i32)
+                    i32.const 0
+                    i32.const 4
+                    call $env_sizes
+                    drop
+                    i32.const 4
+                    i32.load))",
+        )
+    }
+
+    #[test]
+    fn env_with_empty_value_serializes_to_key_equals_null() {
+        // KEY="" should serialize as "KEY=\0" — 5 bytes — and count as 1 env var.
+        let s = Sandbox::builder(ByteSize::mib(1)).build().unwrap();
+        let bytes = env_buf_size_wasm();
+
+        let result = s
+            .module(&bytes)
+            .env("KEY".to_string(), "".to_string())
+            .invoke("buf_size", &[])
+            .unwrap();
+        assert_eq!(result[0].i32(), Some(5)); // "KEY=\0"
+    }
+
+    #[test]
+    fn env_buf_size_matches_total_serialized_length() {
+        // Two env vars; verify the buffer size equals the total serialized bytes.
+        // FOO=1\0  → 3 + 1 + 1 + 1 = 6 bytes
+        // BAR=22\0 → 3 + 1 + 2 + 1 = 7 bytes
+        // Total: 13
+        let s = Sandbox::builder(ByteSize::mib(1)).build().unwrap();
+        let bytes = env_buf_size_wasm();
+
+        let result = s
+            .module(&bytes)
+            .env("FOO".to_string(), "1".to_string())
+            .env("BAR".to_string(), "22".to_string())
+            .invoke("buf_size", &[])
+            .unwrap();
+        assert_eq!(result[0].i32(), Some(13));
+    }
+
+    #[test]
+    fn env_value_content_reaches_guest() {
+        // Single env var so HashMap iteration order doesn't matter.
+        // The guest reads the first byte of the env buffer; for "FOO=1" that's 'F' (70).
+        let s = Sandbox::builder(ByteSize::mib(1)).build().unwrap();
+        let bytes = wasm(
+            "(module
+                (import \"wasi_snapshot_preview1\" \"environ_sizes_get\"
+                    (func $env_sizes (param i32 i32) (result i32)))
+                (import \"wasi_snapshot_preview1\" \"environ_get\"
+                    (func $env_get (param i32 i32) (result i32)))
+                (memory (export \"memory\") 1)
+                (func (export \"first_byte\") (result i32)
+                    ;; environ_sizes_get(count_ptr=0, buf_size_ptr=4)
+                    i32.const 0
+                    i32.const 4
+                    call $env_sizes
+                    drop
+                    ;; environ_get(environ_ptr=8, environ_buf_ptr=64)
+                    i32.const 8
+                    i32.const 64
+                    call $env_get
+                    drop
+                    ;; load the first byte of the env buffer
+                    i32.const 64
+                    i32.load8_u))",
+        );
+
+        let result = s
+            .module(&bytes)
+            .env("FOO".to_string(), "1".to_string())
+            .invoke("first_byte", &[])
+            .unwrap();
+        assert_eq!(result[0].i32(), Some(b'F' as i32)); // 70
+    }
+
+    #[test]
+    fn env_with_unicode_value_uses_utf8_byte_length() {
+        // Non-ASCII values should serialize as UTF-8.
+        // "K=£\0" — '£' is U+00A3, two bytes in UTF-8 (0xC2 0xA3).
+        // Length: 1 (K) + 1 (=) + 2 (£) + 1 (\0) = 5
+        let s = Sandbox::builder(ByteSize::mib(1)).build().unwrap();
+        let bytes = env_buf_size_wasm();
+
+        let result = s
+            .module(&bytes)
+            .env("K".to_string(), "£".to_string())
+            .invoke("buf_size", &[])
+            .unwrap();
+        assert_eq!(result[0].i32(), Some(5));
+    }
 }
